@@ -1,5 +1,6 @@
 """Comprehensive unit tests for LucidNet-Static many-to-one pipeline, dataset cache & inference."""
 
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 from pathlib import Path
@@ -264,6 +265,8 @@ class TestStaticPipeline(unittest.TestCase):
                 zf.writestr("static_new/test_static/s1/gt/gt.png", _png_bytes(130))
 
             zip_bytes = zip_path.read_bytes()
+            get_counter = {"data_gets": 0, "redirects": 0}
+            counter_lock = threading.Lock()
 
             class _RangeHandler(BaseHTTPRequestHandler):
                 def do_HEAD(self) -> None:
@@ -273,6 +276,13 @@ class TestStaticPipeline(unittest.TestCase):
                     self.end_headers()
 
                 def do_GET(self) -> None:
+                    if self.path == "/redirect/atsyn_sample.zip":
+                        with counter_lock:
+                            get_counter["redirects"] += 1
+                        self.send_response(302)
+                        self.send_header("Location", "/cdn/atsyn_sample.zip")
+                        self.end_headers()
+                        return
                     hdr = self.headers.get("Range")
                     if not hdr or not hdr.startswith("bytes="):
                         self.send_response(200)
@@ -280,6 +290,8 @@ class TestStaticPipeline(unittest.TestCase):
                         self.end_headers()
                         self.wfile.write(zip_bytes)
                         return
+                    with counter_lock:
+                        get_counter["data_gets"] += 1
                     start_s, end_s = hdr[6:].split("-")
                     start = int(start_s)
                     end = int(end_s) if end_s else len(zip_bytes) - 1
@@ -299,22 +311,32 @@ class TestStaticPipeline(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                url = f"http://127.0.0.1:{port}/atsyn_sample.zip"
+                url = f"http://127.0.0.1:{port}/redirect/atsyn_sample.zip"
                 pool = _ZipHandlePool(url)
                 try:
                     splits = discover_zip_samples(pool.get_zip())
                     self.assertIn("train", splits)
                     self.assertIn("val", splits)
                     out_base = root / "npy_from_http"
-                    for rec in splits["train"]:
-                        _convert_zip_sample(rec, out_base / "train", pool, include_tilt=True)
-                    for rec in splits["val"]:
-                        _convert_zip_sample(rec, out_base / "val", pool, include_tilt=False)
+                    with ThreadPoolExecutor(max_workers=4) as ex:
+                        futs = [
+                            ex.submit(_convert_zip_sample, rec, out_base / "train", pool, include_tilt=True)
+                            for rec in splits["train"]
+                        ] + [
+                            ex.submit(_convert_zip_sample, rec, out_base / "val", pool, include_tilt=False)
+                            for rec in splits["val"]
+                        ]
+                        for fut in futs:
+                            fut.result()
                 finally:
                     pool.close_all()
             finally:
                 server.shutdown()
                 server.server_close()
+
+            # 302 redirect resolved once; 14 PNG entries fetched in far fewer coalesced Range GETs
+            self.assertEqual(get_counter["redirects"], 1)
+            self.assertLessEqual(get_counter["data_gets"], 8)
 
             train_ds = ATSynDataset(out_base / "train", num_frames=4, crop_size=16, is_train=True)
             val_ds = ATSynDataset(out_base / "val", num_frames=4, crop_size=16, is_train=False)

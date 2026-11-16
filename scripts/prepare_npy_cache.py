@@ -18,11 +18,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import sys
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 import zipfile
+import zlib
 
 import numpy as np
 from PIL import Image
@@ -54,7 +56,7 @@ class ZipSampleRecord:
 
 
 class HTTPRangeFile(io.RawIOBase):
-    """Seekable read-only file-like object backed by HTTP Range requests."""
+    """Seekable read-only file-like object backed by HTTP Range requests (resolved CDN URL cached)."""
 
     def __init__(
         self,
@@ -64,35 +66,49 @@ class HTTPRangeFile(io.RawIOBase):
         max_retries: int = 5,
     ) -> None:
         super().__init__()
-        self.url = url
+        self.source_url = url
+        self.resolved_url = url
+        self.token = token
         self.timeout = timeout
         self.max_retries = max_retries
         self.session = requests.Session()
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
+        self._url_lock = threading.Lock()
         self._pos = 0
         self._size = self._probe_size()
+
+    def _refresh_resolved_url(self, failed_url: Optional[str] = None) -> int:
+        """Follows initial 302 redirect once and caches the direct CDN/LFS URL (thread-safe)."""
+        with self._url_lock:
+            if failed_url is not None and self.resolved_url != failed_url:
+                return self._size
+            hdrs = {"Range": "bytes=0-0"}
+            if self.token:
+                hdrs["Authorization"] = f"Bearer {self.token}"
+            resp = self.session.get(
+                self.source_url,
+                headers=hdrs,
+                allow_redirects=True,
+                timeout=self.timeout,
+            )
+            if resp.status_code == 200:
+                raise RuntimeError(
+                    "Servidor HTTP não suporta Range requests (retornou 200 em vez de 206)."
+                )
+            resp.raise_for_status()
+            self.resolved_url = resp.url
+            cr = resp.headers.get("Content-Range", "")
+            match = re.search(r"/(\d+)$", cr)
+            if match:
+                return int(match.group(1))
+            raise RuntimeError(f"Content-Range ausente na resposta 206 de {self.source_url}")
 
     def _probe_size(self) -> int:
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
-                resp = self.session.get(
-                    self.url,
-                    headers={"Range": "bytes=0-0"},
-                    allow_redirects=True,
-                    timeout=self.timeout,
-                )
-                if resp.status_code == 206:
-                    cr = resp.headers.get("Content-Range", "")
-                    match = re.search(r"/(\d+)$", cr)
-                    if match:
-                        return int(match.group(1))
-                elif resp.status_code == 200:
-                    raise RuntimeError(
-                        "Servidor HTTP não suporta Range requests (retornou 200 em vez de 206)."
-                    )
-                resp.raise_for_status()
+                return self._refresh_resolved_url()
             except RuntimeError:
                 raise
             except Exception as exc:
@@ -100,13 +116,47 @@ class HTTPRangeFile(io.RawIOBase):
                 time.sleep(min(8.0, 0.5 * (2**attempt)))
 
         try:
-            head = self.session.head(self.url, allow_redirects=True, timeout=self.timeout)
+            head = self.session.head(self.source_url, allow_redirects=True, timeout=self.timeout)
             head.raise_for_status()
+            self.resolved_url = head.url
             if "Content-Length" in head.headers:
                 return int(head.headers["Content-Length"])
         except Exception as exc:
             last_exc = exc
-        raise RuntimeError(f"Não foi possível obter tamanho do ZIP remoto: {self.url}") from last_exc
+        raise RuntimeError(f"Não foi possível obter tamanho do ZIP remoto: {self.source_url}") from last_exc
+
+    def fetch_range(self, start: int, end_inclusive: int, session: Optional[requests.Session] = None) -> bytes:
+        """Fetches [start, end_inclusive] directly from resolved CDN URL (auto-refreshing expired signed URLs)."""
+        sess = session or self.session
+        range_hdr = f"bytes={start}-{end_inclusive}"
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                cur_url = self.resolved_url
+                hdrs = {"Range": range_hdr}
+                if self.token and cur_url == self.source_url:
+                    hdrs["Authorization"] = f"Bearer {self.token}"
+                resp = sess.get(
+                    cur_url,
+                    headers=hdrs,
+                    allow_redirects=True,
+                    timeout=self.timeout,
+                )
+                if resp.status_code in (401, 403):
+                    self._refresh_resolved_url(failed_url=cur_url)
+                    continue
+                if resp.status_code == 200:
+                    raise RuntimeError(
+                        "Servidor HTTP ignorou o header Range (retornou 200 em vez de 206)."
+                    )
+                resp.raise_for_status()
+                return resp.content
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(min(8.0, 0.5 * (2**attempt)))
+        raise RuntimeError(f"Falha ao ler range {range_hdr} de {self.source_url}") from last_exc
 
     def readable(self) -> bool:
         return True
@@ -137,34 +187,11 @@ class HTTPRangeFile(io.RawIOBase):
         if n == 0 or self._pos >= self._size:
             return 0
         end = min(self._size - 1, self._pos + n - 1)
-        range_hdr = f"bytes={self._pos}-{end}"
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries):
-            try:
-                resp = self.session.get(
-                    self.url,
-                    headers={"Range": range_hdr},
-                    allow_redirects=True,
-                    timeout=self.timeout,
-                )
-                if resp.status_code == 200:
-                    raise RuntimeError(
-                        "Servidor HTTP ignorou o header Range (retornou 200 em vez de 206)."
-                    )
-                resp.raise_for_status()
-                data = resp.content
-                got = len(data)
-                mv[:got] = data
-                self._pos += got
-                return got
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(min(8.0, 0.5 * (2**attempt)))
-
-        raise RuntimeError(f"Falha ao ler range {range_hdr} de {self.url}") from last_exc
+        data = self.fetch_range(self._pos, end)
+        got = min(len(data), n)
+        mv[:got] = data[:got]
+        self._pos += got
+        return got
 
     def close(self) -> None:
         try:
@@ -174,7 +201,13 @@ class HTTPRangeFile(io.RawIOBase):
 
 
 class _ZipHandlePool:
-    """Maintains one independent ZipFile per worker thread for lock-free thread safety."""
+    """
+    Fast thread-safe ZIP reader:
+      - Reads the Central Directory ONLY ONCE on initialization.
+      - For remote HTTP `.zip`, builds sorted byte-span offsets once and downloads each
+        sample's contiguous frame blocks (e.g. all 50 turb PNGs) in 1 coalesced HTTP Range
+        request per modality via thread-local keep-alive Sessions.
+    """
 
     def __init__(self, source: str, token: Optional[str] = None, buffer_bytes: int = 2 * 1024 * 1024) -> None:
         self.source = source
@@ -183,39 +216,137 @@ class _ZipHandlePool:
         self.is_remote = source.startswith(("http://", "https://"))
         self._local = threading.local()
         self._lock = threading.Lock()
-        self._resources: List[Tuple[zipfile.ZipFile, Optional[io.BufferedReader]]] = []
+        self._sessions: List[requests.Session] = []
+        self._zips: List[zipfile.ZipFile] = []
+
+        self._http_master: Optional[HTTPRangeFile] = None
+        self._span_map: Dict[str, Tuple[int, int, int, int]] = {}
+        self._master_zip: zipfile.ZipFile
+
+        if self.is_remote:
+            self._http_master = HTTPRangeFile(source, token=token)
+            buf = io.BufferedReader(self._http_master, buffer_size=buffer_bytes)
+            self._master_zip = zipfile.ZipFile(buf, mode="r")
+            self._build_span_index(self._master_zip, total_size=self._http_master._size)
+        else:
+            self._master_zip = zipfile.ZipFile(source, mode="r")
+        self._zips.append(self._master_zip)
+
+    def _build_span_index(self, zf: zipfile.ZipFile, total_size: int) -> None:
+        infos = sorted(zf.infolist(), key=lambda zi: zi.header_offset)
+        cd_offset = getattr(zf, "start_dir", total_size)
+        for i, zi in enumerate(infos):
+            next_off = infos[i + 1].header_offset if i + 1 < len(infos) else cd_offset
+            # Safety fallback bound if next_off <= header_offset
+            end_off = max(next_off, zi.header_offset + 64 + len(zi.filename) + zi.compress_size)
+            end_off = min(end_off, total_size)
+            self._span_map[zi.filename] = (zi.header_offset, end_off, zi.compress_size, zi.compress_type)
 
     def get_zip(self) -> zipfile.ZipFile:
-        zf = getattr(self._local, "zf", None)
-        if zf is not None:
+        if not self.is_remote:
+            zf = getattr(self._local, "zf", None)
+            if zf is None:
+                zf = zipfile.ZipFile(self.source, mode="r")
+                self._local.zf = zf
+                with self._lock:
+                    self._zips.append(zf)
             return zf
+        return self._master_zip
 
-        buf: Optional[io.BufferedReader] = None
-        if self.is_remote:
-            raw = HTTPRangeFile(self.source, token=self.token)
-            buf = io.BufferedReader(raw, buffer_size=self.buffer_bytes)
-            zf = zipfile.ZipFile(buf, mode="r")
-        else:
-            zf = zipfile.ZipFile(self.source, mode="r")
+    def _get_session(self) -> requests.Session:
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            self._local.session = sess
+            with self._lock:
+                self._sessions.append(sess)
+        return sess
 
-        self._local.zf = zf
-        with self._lock:
-            self._resources.append((zf, buf))
-        return zf
+    @staticmethod
+    def _unpack_from_span(raw_span: bytes, span_start: int, off: int, comp_size: int, comp_type: int) -> Optional[bytes]:
+        rel = off - span_start
+        if rel < 0 or rel + 30 > len(raw_span) or raw_span[rel : rel + 4] != b"PK\x03\x04":
+            return None
+        fname_len, extra_len = struct.unpack_from("<HH", raw_span, rel + 26)
+        data_start = rel + 30 + fname_len + extra_len
+        data_end = data_start + comp_size
+        if data_end > len(raw_span):
+            return None
+        payload = raw_span[data_start:data_end]
+        if comp_type == zipfile.ZIP_STORED:
+            return payload
+        if comp_type == zipfile.ZIP_DEFLATED:
+            return zlib.decompress(payload, -zlib.MAX_WBITS)
+        return None
+
+    def read_members(self, members: List[str]) -> Dict[str, bytes]:
+        if not self.is_remote:
+            zf = self.get_zip()
+            return {m: zf.read(m) for m in members}
+
+        assert self._http_master is not None
+        entries = []
+        fallback = []
+        for m in members:
+            meta = self._span_map.get(m)
+            if meta is None:
+                fallback.append(m)
+            else:
+                entries.append((meta[0], meta[1], meta[2], meta[3], m))
+
+        entries.sort(key=lambda x: x[0])
+        # Coalesce adjacent ZIP entries (<= 256 KB gap, <= 64 MB chunk) into 1 HTTP GET
+        max_gap = 256 * 1024
+        max_chunk = 64 * 1024 * 1024
+        batches: List[Tuple[int, int, List[Tuple[int, int, int, str]]]] = []
+        for start, end, comp_size, comp_type, m in entries:
+            if (
+                batches
+                and start - batches[-1][1] <= max_gap
+                and end - batches[-1][0] <= max_chunk
+            ):
+                b_start, b_end, items = batches[-1]
+                items.append((start, comp_size, comp_type, m))
+                batches[-1] = (b_start, max(b_end, end), items)
+            else:
+                batches.append((start, end, [(start, comp_size, comp_type, m)]))
+
+        sess = self._get_session()
+        out: Dict[str, bytes] = {}
+        for b_start, b_end, items in batches:
+            raw_span = self._http_master.fetch_range(b_start, b_end - 1, session=sess)
+            for off, comp_size, comp_type, m in items:
+                data = self._unpack_from_span(raw_span, b_start, off, comp_size, comp_type)
+                if data is None:
+                    fallback.append(m)
+                else:
+                    out[m] = data
+
+        if fallback:
+            with self._lock:
+                for m in fallback:
+                    out[m] = self._master_zip.read(m)
+        return out
 
     def close_all(self) -> None:
         with self._lock:
-            for zf, buf in self._resources:
+            for zf in self._zips:
                 try:
                     zf.close()
                 except Exception:
                     pass
-                if buf is not None:
-                    try:
-                        buf.close()
-                    except Exception:
-                        pass
-            self._resources.clear()
+            for sess in self._sessions:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+            if self._http_master is not None:
+                try:
+                    self._http_master.close()
+                except Exception:
+                    pass
+            self._zips.clear()
+            self._sessions.clear()
 
 
 def _normalize_split_name(split_tokens: Tuple[str, ...]) -> str:
@@ -444,15 +575,19 @@ def _convert_zip_sample(
         arr = np.load(turb_dst, mmap_mode="r")
         return record.sample_id, int(arr.shape[0]), tilt_dst.is_file(), False
 
-    zf = zip_pool.get_zip()
+    members_to_read = list(record.turb_members) + [record.gt_member]
+    if want_tilt:
+        members_to_read.extend(record.tilt_members)
+
+    raw_map = zip_pool.read_members(members_to_read)
     turb_arr = np.stack(
-        [_read_rgb_uint8_bytes(zf.read(m)) for m in record.turb_members], axis=0
+        [_read_rgb_uint8_bytes(raw_map[m]) for m in record.turb_members], axis=0
     )
-    gt_arr = _read_rgb_uint8_bytes(zf.read(record.gt_member))
+    gt_arr = _read_rgb_uint8_bytes(raw_map[record.gt_member])
     tilt_arr: Optional[np.ndarray] = None
     if want_tilt:
         tilt_arr = np.stack(
-            [_read_rgb_uint8_bytes(zf.read(m)) for m in record.tilt_members], axis=0
+            [_read_rgb_uint8_bytes(raw_map[m]) for m in record.tilt_members], axis=0
         )
 
     sample_out.mkdir(parents=True, exist_ok=True)
@@ -486,7 +621,7 @@ def _run_pool(
                 skipped += 1
             if has_tilt:
                 with_tilt += 1
-            if idx % 200 == 0 or idx == total:
+            if idx % 50 == 0 or idx == total:
                 print(
                     f"[prepare_npy_cache:{label}] {idx}/{total} "
                     f"(converted={converted}, skipped={skipped}, with_tilt={with_tilt})",

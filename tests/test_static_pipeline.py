@@ -1,15 +1,24 @@
 """Comprehensive unit tests for LucidNet-Static many-to-one pipeline, dataset cache & inference."""
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+import zipfile
 
 import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import DataLoader
 
-from scripts.prepare_npy_cache import _convert_sample
+from scripts.prepare_npy_cache import (
+    _ZipHandlePool,
+    _convert_sample,
+    _convert_zip_sample,
+    discover_zip_samples,
+)
 from src.data.atsyn_dataset import ATSynDataset, collate_video_batch, discover_static_samples
 from src.engine.evaluator import Evaluator
 from src.engine.inference import VideoInferenceEngine
@@ -207,6 +216,93 @@ class TestStaticPipeline(unittest.TestCase):
             summary = evaluator.evaluate_loader(model, loader)
             for key in ("PSNR", "SSIM", "CW-SSIM", "FRF_PSNR", "FRF_SSIM", "PSNR_Gain", "SSIM_Gain", "Rectified_PSNR"):
                 self.assertIn(key, summary)
+
+    def test_zip_and_http_range_conversion_plus_delete_raw(self) -> None:
+        def _png_bytes(val: int, h: int = 32, w: int = 32) -> bytes:
+            buf = io.BytesIO()
+            Image.fromarray(np.full((h, w, 3), val, dtype=np.uint8)).save(buf, format="PNG")
+            return buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            zip_path = root / "atsyn_sample.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                for i in range(4):
+                    zf.writestr(f"static_new/train_static/turb/catA/s0/{i:03d}.png", _png_bytes(40 + i))
+                    zf.writestr(f"static_new/train_static/tilt/catA/s0/{i:03d}.png", _png_bytes(70 + i))
+                    zf.writestr(f"static_new/test_static/s1/turb/{i:03d}.png", _png_bytes(50 + i))
+                zf.writestr("static_new/train_static/gt/catA/s0.png", _png_bytes(110))
+                zf.writestr("static_new/test_static/s1/gt/gt.png", _png_bytes(130))
+
+            zip_bytes = zip_path.read_bytes()
+
+            class _RangeHandler(BaseHTTPRequestHandler):
+                def do_HEAD(self) -> None:
+                    self.send_response(200)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(len(zip_bytes)))
+                    self.end_headers()
+
+                def do_GET(self) -> None:
+                    hdr = self.headers.get("Range")
+                    if not hdr or not hdr.startswith("bytes="):
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(zip_bytes)))
+                        self.end_headers()
+                        self.wfile.write(zip_bytes)
+                        return
+                    start_s, end_s = hdr[6:].split("-")
+                    start = int(start_s)
+                    end = int(end_s) if end_s else len(zip_bytes) - 1
+                    chunk = zip_bytes[start : end + 1]
+                    self.send_response(206)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{len(zip_bytes)}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    self.wfile.write(chunk)
+
+                def log_message(self, format: str, *args) -> None:
+                    del format, args
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _RangeHandler)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{port}/atsyn_sample.zip"
+                pool = _ZipHandlePool(url)
+                try:
+                    splits = discover_zip_samples(pool.get_zip())
+                    self.assertIn("train", splits)
+                    self.assertIn("val", splits)
+                    out_base = root / "npy_from_http"
+                    for rec in splits["train"]:
+                        _convert_zip_sample(rec, out_base / "train", pool, include_tilt=True)
+                    for rec in splits["val"]:
+                        _convert_zip_sample(rec, out_base / "val", pool, include_tilt=False)
+                finally:
+                    pool.close_all()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+            train_ds = ATSynDataset(out_base / "train", num_frames=4, crop_size=16, is_train=True)
+            val_ds = ATSynDataset(out_base / "val", num_frames=4, crop_size=16, is_train=False)
+            self.assertEqual(len(train_ds), 1)
+            self.assertEqual(len(val_ds), 1)
+            self.assertIsNotNone(train_ds[0].tilt_only)
+            self.assertIsNone(val_ds[0].tilt_only)
+
+            # Verify --delete-raw removes source sample directory after writing .npy
+            raw_split = root / "raw_del"
+            for i in range(4):
+                _save_dummy_png(raw_split / "s0" / "turb" / f"{i:03d}.png", 40, h=32, w=32)
+            _save_dummy_png(raw_split / "s0" / "gt" / "gt.png", 90, h=32, w=32)
+            raw_rec = discover_static_samples(raw_split)[0]
+            _convert_sample(raw_rec, root / "npy_del", include_tilt=False, delete_raw=True)
+            self.assertFalse((raw_split / "s0").exists())
+            self.assertTrue((root / "npy_del" / "s0" / "turb.npy").is_file())
 
 
 if __name__ == "__main__":

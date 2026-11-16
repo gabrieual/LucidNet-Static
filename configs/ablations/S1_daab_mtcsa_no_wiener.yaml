@@ -1,0 +1,27 @@
+# Static Ablation S1: Parallel DAAB + StaticCollapseMTCSA (Without Wiener Deconv & Without L_tilt)
+_base_: "../default.yaml"
+
+experiment:
+  name: "S1_daab_mtcsa_no_wiener"
+
+model:
+  prior_extractor:
+    name: "classical_full"
+    enable_motion_mask: false
+  alignment:
+    name: "daab_static_parallel"
+  fusion:
+    name: "mtcsa_static_collapse"
+    spatial_window: 8
+    num_heads: 4
+  deconv:
+    name: "identity_upsample"
+  decoder:
+    name: "static_single_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+    anchor_mode: "auto"
+
+loss:
+  lambda_tilt: 0.0
+  lambda_tv: 0.0

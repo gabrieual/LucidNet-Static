@@ -1,0 +1,25 @@
+# Static Ablation S0: Optical Flow + Static Lucky Weighted Fusion (No DAAB, No MTCSA, No Wiener, No L_tilt)
+_base_: "../default.yaml"
+
+experiment:
+  name: "S0_flow_only"
+
+model:
+  prior_extractor:
+    name: "classical_full"
+    enable_motion_mask: false
+  alignment:
+    name: "optical_flow_only"
+  fusion:
+    name: "lucky_weighted_static"
+  deconv:
+    name: "identity_upsample"
+  decoder:
+    name: "static_single_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+    anchor_mode: "auto"
+
+loss:
+  lambda_tilt: 0.0
+  lambda_tv: 0.0

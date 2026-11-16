@@ -1,0 +1,14 @@
+# Dataset Configuration: ATSyn-Static (Many-to-One Static Turbulence Benchmark)
+data:
+  dataset_type: "atsyn"
+  train_root: "datasets/ATSyn_static/train"
+  val_root: "datasets/ATSyn_static/test"
+  test_root: "datasets/ATSyn_static/test"
+  num_frames: 8
+  crop_size: 256
+  batch_size: 4
+  num_workers: 4
+  allow_synthetic_fallback: false
+  fallback_length: 64
+  static_target: true
+  return_all_frames: false

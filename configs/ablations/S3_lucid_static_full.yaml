@@ -1,0 +1,35 @@
+# Static Ablation S3: Complete LucidNet-Static (Parallel DAAB + StaticCollapseMTCSA + 1x Wiener 2D-FFT + Twin Tilt Branch)
+_base_: "../default.yaml"
+
+experiment:
+  name: "S3_lucid_static_full"
+
+model:
+  prior_extractor:
+    name: "classical_full"
+    enable_motion_mask: false
+  alignment:
+    name: "daab_static_parallel"
+  fusion:
+    name: "mtcsa_static_collapse"
+    spatial_window: 8
+    num_heads: 4
+  deconv:
+    name: "wiener_fft_multichannel"
+    kernel_size: 15
+    eps_min: 0.01
+    pad_size: 8
+  decoder:
+    name: "static_twin_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+    max_tilt_displacement: 16.0
+    anchor_mode: "auto"
+
+loss:
+  lambda_char: 0.8
+  lambda_tilt: 0.2
+  lambda_fft: 0.05
+  lambda_tv: 0.01
+  lambda_cw_ssim: 0.1
+  lambda_lpips: 0.02

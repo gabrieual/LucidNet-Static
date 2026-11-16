@@ -1,5 +1,8 @@
 """Shape and mathematical invariant tests wrapper."""
 
-from tests.test_shapes_and_contracts import TestShapesAndContracts
+try:
+    from test_shapes_and_contracts import TestShapesAndContracts
+except ImportError:
+    from tests.test_shapes_and_contracts import TestShapesAndContracts
 
 __all__ = ["TestShapesAndContracts"]

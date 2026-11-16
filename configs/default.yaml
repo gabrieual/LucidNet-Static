@@ -15,9 +15,9 @@ data:
   train_root: "datasets/ATSyn_static/train"
   val_root: "datasets/ATSyn_static/test"
   test_root: "datasets/ATSyn_static/test"
-  num_frames: 8
+  num_frames: 16
   crop_size: 256
-  batch_size: 4
+  batch_size: 2
   num_workers: 4
   allow_synthetic_fallback: false
   fallback_length: 64
@@ -85,7 +85,7 @@ train:
   min_lr: 0.000001
   weight_decay: 0.0001
   grad_clip_norm: 20.0
-  grad_accum_steps: 1
+  grad_accum_steps: 2
   ema_decay: 0.999
   use_amp: true
   amp_dtype: "bfloat16"

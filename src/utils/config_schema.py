@@ -209,9 +209,9 @@ if HAS_PYDANTIC:
         train_root: str = "datasets/ATSyn_static/train"
         val_root: str = "datasets/ATSyn_static/test"
         test_root: str = "datasets/ATSyn_static/test"
-        num_frames: int = 8
+        num_frames: int = 16
         crop_size: int = 256
-        batch_size: int = 4
+        batch_size: int = 2
         num_workers: int = 4
         allow_synthetic_fallback: bool = False
         fallback_length: int = 64
@@ -245,7 +245,7 @@ if HAS_PYDANTIC:
         min_lr: float = 0.000001
         weight_decay: float = 0.0001
         grad_clip_norm: float = 20.0
-        grad_accum_steps: int = 1
+        grad_accum_steps: int = 2
         ema_decay: float = 0.999
         use_amp: bool = True
         amp_dtype: Literal["bfloat16", "float16"] = "bfloat16"

@@ -217,6 +217,35 @@ class TestStaticPipeline(unittest.TestCase):
             for key in ("PSNR", "SSIM", "CW-SSIM", "FRF_PSNR", "FRF_SSIM", "PSNR_Gain", "SSIM_Gain", "Rectified_PSNR"):
                 self.assertIn(key, summary)
 
+    def test_metrics_match_gaussian_ssim_and_clamped_psnr(self) -> None:
+        from src.metrics.optical_metrics import compute_psnr, compute_ssim
+
+        torch.manual_seed(7)
+        pred = torch.rand(2, 3, 64, 64) * 1.2 - 0.1  # includes out-of-[0, 1] values
+        target = torch.rand(2, 3, 64, 64)
+
+        psnr_val = compute_psnr(pred, target)
+        ssim_val = compute_ssim(pred, target)
+
+        pred_c = pred.clamp(0.0, 1.0)
+        mse = ((pred_c - target) ** 2).mean(dim=(1, 2, 3)).clamp_min(1.0e-12)
+        expected_psnr = float((10.0 * torch.log10(1.0 / mse)).mean().item())
+        self.assertAlmostEqual(psnr_val, expected_psnr, places=6)
+        self.assertGreater(ssim_val, 0.0)
+        self.assertLess(ssim_val, 1.0)
+
+        # Verify ResUNet image_metrics parity when ResUNet sibling exists in workspace
+        resunet_metrics = PROJECT_ROOT.parent / "ResUNet" / "src" / "metrics" / "image_metrics.py"
+        if resunet_metrics.is_file():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("resunet_image_metrics", resunet_metrics)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertAlmostEqual(psnr_val, mod.compute_psnr(pred, target), places=6)
+            self.assertAlmostEqual(ssim_val, mod.compute_ssim(pred, target), places=6)
+
     def test_zip_and_http_range_conversion_plus_delete_raw(self) -> None:
         def _png_bytes(val: int, h: int = 32, w: int = 32) -> bytes:
             buf = io.BytesIO()

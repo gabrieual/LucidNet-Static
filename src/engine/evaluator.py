@@ -73,6 +73,7 @@ class Evaluator:
                 cw_ssim = compute_cw_ssim(pred_restored, gt_recon)
                 frf_psnr = compute_psnr(pred_frf, gt_frf)
                 frf_ssim = compute_ssim(pred_frf, gt_frf)
+                frf_cw_ssim = compute_cw_ssim(pred_frf, gt_frf)
                 rect_psnr = compute_psnr(pred_rectified, gt_rect)
 
                 tracker.update(
@@ -82,8 +83,10 @@ class Evaluator:
                         "CW-SSIM": cw_ssim,
                         "FRF_PSNR": frf_psnr,
                         "FRF_SSIM": frf_ssim,
+                        "FRF_CW_SSIM": frf_cw_ssim,
                         "PSNR_Gain": psnr - frf_psnr,
                         "SSIM_Gain": ssim - frf_ssim,
+                        "CW_SSIM_Gain": cw_ssim - frf_cw_ssim,
                         "Rectified_PSNR": rect_psnr,
                     },
                     n=b,

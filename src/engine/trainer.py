@@ -279,6 +279,7 @@ class Trainer:
                 rect_psnr = compute_psnr(pred_rectified, gt_rect)
                 frf_psnr = compute_psnr(frf_clamped, gt_frf)
                 frf_ssim = compute_ssim(frf_clamped, gt_frf)
+                frf_cw_ssim = compute_cw_ssim(frf_clamped, gt_frf)
 
                 tracker.update(
                     {
@@ -288,8 +289,10 @@ class Trainer:
                         "val/rectified_psnr": rect_psnr,
                         "val/frf_psnr": frf_psnr,
                         "val/frf_ssim": frf_ssim,
+                        "val/frf_cw_ssim": frf_cw_ssim,
                         "val/psnr_gain": psnr - frf_psnr,
                         "val/ssim_gain": ssim - frf_ssim,
+                        "val/cw_ssim_gain": cw_ssim - frf_cw_ssim,
                     },
                     n=batch.degraded.shape[0],
                 )
